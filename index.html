@@ -44,6 +44,8 @@
   .result { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
   .result a { text-decoration: none; display: inline-block; }
   .note { margin-top: 22px; font-size: 0.85rem; color: var(--muted); }
+  #faces canvas { cursor: pointer; touch-action: manipulation; }
+  #facesHint { margin: 0 0 8px; color: var(--ink); font-weight: 600; }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
@@ -64,6 +66,11 @@
       <span class="ph"><strong>2. Video</strong><br><small>Mejor corto, de 5 a 30 s</small></span>
     </label>
   </div>
+
+  <section class="stage" id="faces">
+    <p class="status" id="facesHint"></p>
+    <canvas id="facesCv"></canvas>
+  </section>
 
   <div class="opts">
     <label class="check"><input type="checkbox" id="consent">
@@ -91,7 +98,8 @@
 </main>
 
 <script type="module">
-import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+const LIB = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+let FaceLandmarker, FilesetResolver;
 
 const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
 const MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
@@ -104,10 +112,12 @@ const els = {
   photoIn: $("photoIn"), videoIn: $("videoIn"), photoPrev: $("photoPrev"), videoPrev: $("videoPrev"),
   pickPhoto: $("pickPhoto"), pickVideo: $("pickVideo"), consent: $("consent"), mark: $("mark"),
   go: $("go"), bar: $("bar"), status: $("status"), stage: $("stage"), live: $("live"),
+  faces: $("faces"), facesCv: $("facesCv"), facesHint: $("facesHint"),
   outStage: $("outStage"), outVideo: $("outVideo"), dl: $("dl"), shareBtn: $("shareBtn"),
 };
 
 let imageLandmarker = null, videoLandmarker = null, triangles = [];
+let faceCands = [], pickerFrame = null;
 let photoFile = null, videoFile = null, running = false, resultFile = null, audioCtx = null;
 
 function setStatus(msg, isErr = false) { els.status.textContent = msg; els.status.classList.toggle("err", isErr); }
@@ -127,8 +137,12 @@ function buildTriangles() {
 }
 
 async function init() {
+  let step = "la librería";
   try {
+    ({ FaceLandmarker, FilesetResolver } = await import(LIB));
+    step = "los archivos del detector (wasm)";
     const fileset = await FilesetResolver.forVisionTasks(WASM);
+    step = "el modelo de caras";
     const make = (mode, delegate, n) => FaceLandmarker.createFromOptions(fileset, {
       baseOptions: { modelAssetPath: MODEL, delegate }, runningMode: mode, numFaces: n,
     });
@@ -141,9 +155,10 @@ async function init() {
     }
     triangles = buildTriangles();
     setStatus("Listo. Elige la foto y el video.");
+    loadFacePicker();
   } catch (e) {
     console.error(e);
-    setStatus("No se pudo cargar el detector de caras. Revisa tu conexión y recarga la página.", true);
+    setStatus(`No se pudo cargar ${step} (${e.message}). Abre la página desde tu propio hosting HTTPS, no desde la vista previa de Claude, y recarga.`, true);
   }
   refreshGo();
 }
@@ -160,6 +175,7 @@ els.videoIn.addEventListener("change", () => {
     els.videoPrev.src = URL.createObjectURL(videoFile);
     els.videoPrev.currentTime = 0.1;
     els.pickVideo.classList.add("has-file");
+    loadFacePicker();
   }
   refreshGo();
 });
@@ -196,6 +212,67 @@ function drawTriangle(ctx, tex, s0, s1, s2, d0, d1, d2) {
   ctx.restore();
 }
 
+/* ---------- Elegir qué caras del video se cambian ---------- */
+function centroid(lm) {
+  let x = 0, y = 0;
+  for (const p of lm) { x += p.x; y += p.y; }
+  return { x: x / lm.length, y: y / lm.length };
+}
+
+async function loadFacePicker() {
+  faceCands = []; els.faces.style.display = "none";
+  if (!imageLandmarker || !videoFile) return;
+  const file = videoFile;
+  try {
+    const v = document.createElement("video");
+    v.muted = true; v.playsInline = true; v.preload = "auto"; v.src = URL.createObjectURL(file);
+    await new Promise((res, rej) => { v.onloadeddata = res; v.onerror = rej; });
+    const w = Math.min(v.videoWidth, 480);
+    const h = Math.round(v.videoHeight * w / v.videoWidth);
+    pickerFrame = document.createElement("canvas"); pickerFrame.width = w; pickerFrame.height = h;
+    pickerFrame.getContext("2d").drawImage(v, 0, 0, w, h);
+    await imageLandmarker.setOptions({ numFaces: 6 });
+    const res = imageLandmarker.detect(pickerFrame);
+    if (file !== videoFile) return;
+    faceCands = res.faceLandmarks.map((lm) => {
+      const c = centroid(lm);
+      return { cx: c.x, cy: c.y, box: bbox(toPixels(lm, w, h), 0.12, w, h), selected: true };
+    });
+    if (faceCands.length > 1) {
+      els.facesCv.width = w; els.facesCv.height = h;
+      els.faces.style.display = "block";
+      drawPicker();
+    }
+  } catch (e) { console.warn("No se pudo previsualizar las caras:", e); faceCands = []; }
+}
+
+function drawPicker() {
+  const cv = els.facesCv, ctx = cv.getContext("2d");
+  ctx.drawImage(pickerFrame, 0, 0);
+  faceCands.forEach((c, i) => {
+    ctx.lineWidth = c.selected ? 4 : 2;
+    ctx.strokeStyle = c.selected ? "#0b7a75" : "#ffffff";
+    ctx.setLineDash(c.selected ? [] : [6, 5]);
+    ctx.strokeRect(c.box.x, c.box.y, c.box.w, c.box.h);
+    ctx.setLineDash([]);
+    ctx.fillStyle = c.selected ? "#0b7a75" : "rgba(0,0,0,.6)";
+    ctx.beginPath(); ctx.arc(c.box.x + 16, c.box.y + 16, 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "#fff"; ctx.font = "600 15px system-ui, sans-serif";
+    ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(String(i + 1), c.box.x + 16, c.box.y + 17);
+  });
+  const n = faceCands.filter((c) => c.selected).length;
+  els.facesHint.textContent = `Toca las caras que quieres cambiar (${n} de ${faceCands.length})`;
+}
+
+els.facesCv.addEventListener("click", (e) => {
+  const r = els.facesCv.getBoundingClientRect();
+  const x = (e.clientX - r.left) * els.facesCv.width / r.width;
+  const y = (e.clientY - r.top) * els.facesCv.height / r.height;
+  const hit = faceCands.find((c) => x >= c.box.x && x <= c.box.x + c.box.w && y >= c.box.y && y <= c.box.y + c.box.h);
+  if (hit) { hit.selected = !hit.selected; drawPicker(); }
+});
+
 /* ---------- Cara de origen (foto) ---------- */
 let faceTex = null, facePts = null;
 
@@ -205,6 +282,7 @@ async function prepareSourceFace(file) {
   const c = document.createElement("canvas");
   c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
   c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+  await imageLandmarker.setOptions({ numFaces: 1 });
   const res = imageLandmarker.detect(c);
   if (!res.faceLandmarks.length) throw new Error("No encontré ninguna cara en la foto. Prueba con otra donde se vea de frente.");
   const pts = toPixels(res.faceLandmarks[0], c.width, c.height);
@@ -288,6 +366,8 @@ async function process() {
   running = true; refreshGo();
   els.outStage.style.display = "none"; resultFile = null;
   try {
+    const tracked = faceCands.length ? faceCands.filter((c) => c.selected).map((c) => ({ x: c.cx, y: c.cy })) : null;
+    if (tracked && !tracked.length) throw new Error("Elige al menos una cara del video para cambiar.");
     setStatus("Analizando la cara de la foto…");
     await prepareSourceFace(photoFile);
 
@@ -329,7 +409,23 @@ async function process() {
       ctx.drawImage(video, 0, 0, W, H);
       const ts = Math.max(performance.now(), lastTs + 1); lastTs = ts;
       const res = videoLandmarker.detectForVideo(video, ts);
-      if (res.faceLandmarks.length) for (const lm of res.faceLandmarks) swapFace(ctx, toPixels(lm, W, H), W, H);
+      const faces = res.faceLandmarks;
+      let targets = faces;
+      if (tracked) {
+        // Sigue cada cara elegida: se empareja con la más cercana a su última posición.
+        targets = [];
+        const used = new Set();
+        for (const t of tracked) {
+          let best = -1, bd = 0.3;
+          faces.forEach((lm, i) => {
+            if (used.has(i)) return;
+            const c = centroid(lm), d = Math.hypot(c.x - t.x, c.y - t.y);
+            if (d < bd) { bd = d; best = i; }
+          });
+          if (best >= 0) { used.add(best); const c = centroid(faces[best]); t.x = c.x; t.y = c.y; targets.push(faces[best]); }
+        }
+      }
+      if (faces.length) for (const lm of targets) swapFace(ctx, toPixels(lm, W, H), W, H);
       else noFaceFrames++;
       if (els.mark.checked) {
         ctx.font = `600 ${fontPx}px system-ui, sans-serif`;
