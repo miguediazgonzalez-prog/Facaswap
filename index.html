@@ -43,6 +43,9 @@
   .stage canvas, .stage video { width: 100%; height: auto; border-radius: 12px; background: #000; display: block; }
   .result { display: flex; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
   .result a { text-decoration: none; display: inline-block; }
+  .slider { display: grid; gap: 4px; font-size: 0.93rem; }
+  .slider input { width: 100%; accent-color: var(--accent); }
+  .slider small { color: var(--muted); }
   .note { margin-top: 22px; font-size: 0.85rem; color: var(--muted); }
   #faces canvas { cursor: pointer; touch-action: manipulation; }
   #facesHint { margin: 0 0 8px; color: var(--ink); font-weight: 600; }
@@ -75,6 +78,11 @@
   <div class="opts">
     <label class="check"><input type="checkbox" id="consent">
       <span>La cara de la foto es mía o tengo permiso de esa persona, y de quienes salen en el video.</span></label>
+    <label class="slider">
+      <span>Parecido a la foto: <strong id="likeVal">55%</strong></span>
+      <input type="range" id="like" min="0" max="100" value="55">
+      <small>Más alto conserva más las proporciones de la foto; más bajo encaja mejor con la cara del video.</small>
+    </label>
     <label class="check"><input type="checkbox" id="mark" checked>
       <span>Añadir la marca «Editado con IA» en una esquina.</span></label>
   </div>
@@ -112,6 +120,7 @@ const els = {
   photoIn: $("photoIn"), videoIn: $("videoIn"), photoPrev: $("photoPrev"), videoPrev: $("videoPrev"),
   pickPhoto: $("pickPhoto"), pickVideo: $("pickVideo"), consent: $("consent"), mark: $("mark"),
   go: $("go"), bar: $("bar"), status: $("status"), stage: $("stage"), live: $("live"),
+  like: $("like"), likeVal: $("likeVal"),
   faces: $("faces"), facesCv: $("facesCv"), facesHint: $("facesHint"),
   outStage: $("outStage"), outVideo: $("outVideo"), dl: $("dl"), shareBtn: $("shareBtn"),
 };
@@ -180,6 +189,7 @@ els.videoIn.addEventListener("change", () => {
   refreshGo();
 });
 els.consent.addEventListener("change", refreshGo);
+els.like.addEventListener("input", () => { els.likeVal.textContent = els.like.value + "%"; });
 
 /* ---------- Geometría ---------- */
 function toPixels(lms, w, h) { return lms.map((p) => ({ x: p.x * w, y: p.y * h })); }
@@ -208,7 +218,11 @@ function drawTriangle(ctx, tex, s0, s1, s2, d0, d1, d2) {
   ctx.save();
   ctx.beginPath(); ctx.moveTo(e0.x, e0.y); ctx.lineTo(e1.x, e1.y); ctx.lineTo(e2.x, e2.y); ctx.closePath(); ctx.clip();
   ctx.transform(a, b, c, d, e, f);
-  ctx.drawImage(tex, 0, 0);
+  const rx0 = Math.max(0, Math.floor(Math.min(s0.x, s1.x, s2.x)) - 1);
+  const ry0 = Math.max(0, Math.floor(Math.min(s0.y, s1.y, s2.y)) - 1);
+  const rx1 = Math.min(tex.width, Math.ceil(Math.max(s0.x, s1.x, s2.x)) + 1);
+  const ry1 = Math.min(tex.height, Math.ceil(Math.max(s0.y, s1.y, s2.y)) + 1);
+  if (rx1 > rx0 && ry1 > ry0) ctx.drawImage(tex, rx0, ry0, rx1 - rx0, ry1 - ry0, rx0, ry0, rx1 - rx0, ry1 - ry0);
   ctx.restore();
 }
 
@@ -287,7 +301,7 @@ async function prepareSourceFace(file) {
   if (!res.faceLandmarks.length) throw new Error("No encontré ninguna cara en la foto. Prueba con otra donde se vea de frente.");
   const pts = toPixels(res.faceLandmarks[0], c.width, c.height);
   const box = bbox(pts, 0.08, c.width, c.height);
-  const k = Math.min(1, 512 / Math.max(box.w, box.h));
+  const k = Math.min(1, 768 / Math.max(box.w, box.h));
   faceTex = document.createElement("canvas");
   faceTex.width = Math.round(box.w * k); faceTex.height = Math.round(box.h * k);
   faceTex.getContext("2d").drawImage(c, box.x, box.y, box.w, box.h, 0, 0, faceTex.width, faceTex.height);
@@ -321,39 +335,120 @@ function buildMask(pts, ox, oy, w, h) {
   mctx.globalAlpha = 1;
 }
 
-function swapFace(ctx, targetPts, W, H) {
-  const box = bbox(targetPts, 0.06, W, H);
+// Puntos estables para alinear la cara de la foto con la del video.
+const KEY = [33, 263, 1, 61, 291, 152, 10, 234, 454];
+
+function similarity(from, to) {
+  const n = from.length;
+  let fx = 0, fy = 0, tx = 0, ty = 0;
+  for (let i = 0; i < n; i++) { fx += from[i].x; fy += from[i].y; tx += to[i].x; ty += to[i].y; }
+  fx /= n; fy /= n; tx /= n; ty /= n;
+  let a = 0, b = 0, d = 0;
+  for (let i = 0; i < n; i++) {
+    const x = from[i].x - fx, y = from[i].y - fy, u = to[i].x - tx, v = to[i].y - ty;
+    a += x * u + y * v; b += x * v - y * u; d += x * x + y * y;
+  }
+  const p = a / (d || 1), q = b / (d || 1);
+  return (pt) => ({ x: p * (pt.x - fx) - q * (pt.y - fy) + tx, y: q * (pt.x - fx) + p * (pt.y - fy) + ty });
+}
+
+// Mezcla la forma de la cara del video con la de la foto. Los rasgos internos (ojos, boca)
+// siguen al video para conservar la expresión; el contorno y los pómulos se acercan a la foto.
+function blendGeometry(tp, likeness) {
+  if (likeness < 0.01) return tp;
+  const T = similarity(KEY.map((i) => facePts[i]), KEY.map((i) => tp[i]));
+  let cx = 0, cy = 0;
+  for (const p of tp) { cx += p.x; cy += p.y; }
+  cx /= tp.length; cy /= tp.length;
+  const fw = Math.hypot(tp[454].x - tp[234].x, tp[454].y - tp[234].y) || 1;
+  return tp.map((p, i) => {
+    const q = T(facePts[i]);
+    const r = Math.hypot(p.x - cx, p.y - cy) / fw;
+    const w = likeness * Math.min(1, Math.max(0, (r - 0.28) / 0.3));
+    return { x: p.x + (q.x - p.x) * w, y: p.y + (q.y - p.y) * w };
+  });
+}
+
+const G = 20; // rejilla para la corrección de luz
+const smallL = document.createElement("canvas"), smallF = document.createElement("canvas");
+smallL.width = smallL.height = smallF.width = smallF.height = G;
+const sl = smallL.getContext("2d", { willReadFrequently: true });
+const sf = smallF.getContext("2d", { willReadFrequently: true });
+
+function swapFace(ctx, targetPts, W, H, likeness) {
+  const pts = blendGeometry(targetPts, likeness);
+  const box = bbox(pts, 0.06, W, H);
   layer.width = box.w; layer.height = box.h;
   lctx.clearRect(0, 0, box.w, box.h);
-  const dst = targetPts.map((p) => ({ x: p.x - box.x, y: p.y - box.y }));
+  const dst = pts.map((p) => ({ x: p.x - box.x, y: p.y - box.y }));
   for (const [i, j, k] of triangles) drawTriangle(lctx, faceTex, facePts[i], facePts[j], facePts[k], dst[i], dst[j], dst[k]);
 
-  buildMask(targetPts, box.x, box.y, box.w, box.h);
+  buildMask(pts, box.x, box.y, box.w, box.h);
   lctx.globalCompositeOperation = "destination-in";
   lctx.drawImage(maskC, 0, 0);
   lctx.globalCompositeOperation = "source-over";
 
-  // Ajuste de color: acerca el tono de la cara nueva al de la escena.
-  const L = lctx.getImageData(0, 0, box.w, box.h);
-  const F = ctx.getImageData(box.x, box.y, box.w, box.h);
-  let lr = 0, lg = 0, lb = 0, fr = 0, fg = 0, fb = 0, n = 0;
-  for (let p = 0; p < L.data.length; p += 16) {
-    if (L.data[p + 3] > 200) {
-      lr += L.data[p]; lg += L.data[p + 1]; lb += L.data[p + 2];
-      fr += F.data[p]; fg += F.data[p + 1]; fb += F.data[p + 2]; n++;
+  // Corrección de iluminación: diferencia de color a baja resolución entre la escena y la cara nueva.
+  // En el borde se corrige por completo (sin costura); en el centro solo a medias (conserva el tono de la foto).
+  sl.clearRect(0, 0, G, G); sf.clearRect(0, 0, G, G);
+  sl.drawImage(layer, 0, 0, box.w, box.h, 0, 0, G, G);
+  sf.drawImage(ctx.canvas, box.x, box.y, box.w, box.h, 0, 0, G, G);
+  const SL = sl.getImageData(0, 0, G, G).data, SF = sf.getImageData(0, 0, G, G).data;
+  const dif = new Float32Array(G * G * 3), ok = new Uint8Array(G * G);
+  let mr = 0, mg = 0, mb = 0, cnt = 0;
+  for (let c = 0; c < G * G; c++) {
+    if (SL[c * 4 + 3] < 110) continue;
+    ok[c] = 1; cnt++;
+    for (let k = 0; k < 3; k++) {
+      const d = Math.max(-60, Math.min(60, SF[c * 4 + k] - SL[c * 4 + k]));
+      dif[c * 3 + k] = d;
     }
+    mr += dif[c * 3]; mg += dif[c * 3 + 1]; mb += dif[c * 3 + 2];
   }
-  if (n > 20) {
-    const g = (f, l) => { const r = (f / n) / Math.max(1, l / n); return 1 + (Math.min(1.4, Math.max(0.7, r)) - 1) * 0.85; };
-    const gr = g(fr, lr), gg = g(fg, lg), gb = g(fb, lb);
-    for (let p = 0; p < L.data.length; p += 4) {
-      L.data[p] = Math.min(255, L.data[p] * gr);
-      L.data[p + 1] = Math.min(255, L.data[p + 1] * gg);
-      L.data[p + 2] = Math.min(255, L.data[p + 2] * gb);
+  if (cnt > 6) {
+    mr /= cnt; mg /= cnt; mb /= cnt;
+    const L = lctx.getImageData(0, 0, box.w, box.h);
+    const d = L.data;
+    const xs = new Array(box.w);
+    for (let x = 0; x < box.w; x++) {
+      const g = Math.max(0, Math.min(G - 1.001, (x + 0.5) / box.w * G - 0.5));
+      xs[x] = [Math.floor(g), g - Math.floor(g)];
+    }
+    for (let y = 0; y < box.h; y++) {
+      const g = Math.max(0, Math.min(G - 1.001, (y + 0.5) / box.h * G - 0.5));
+      const y0 = Math.floor(g), fy = g - y0;
+      for (let x = 0; x < box.w; x++) {
+        const o = (y * box.w + x) * 4;
+        const al = d[o + 3];
+        if (!al) continue;
+        const [x0, fx] = xs[x];
+        const c00 = y0 * G + x0, c10 = c00 + 1, c01 = c00 + G, c11 = c01 + 1;
+        const w00 = ok[c00] * (1 - fx) * (1 - fy), w10 = ok[c10] * fx * (1 - fy);
+        const w01 = ok[c01] * (1 - fx) * fy, w11 = ok[c11] * fx * fy;
+        const ws = w00 + w10 + w01 + w11;
+        const k = 1 - 0.5 * (al / 255);
+        if (ws > 0.001) {
+          for (let ch = 0; ch < 3; ch++) {
+            const v = (dif[c00 * 3 + ch] * w00 + dif[c10 * 3 + ch] * w10 + dif[c01 * 3 + ch] * w01 + dif[c11 * 3 + ch] * w11) / ws;
+            d[o + ch] += v * k;
+          }
+        } else { d[o] += mr * k; d[o + 1] += mg * k; d[o + 2] += mb * k; }
+      }
     }
     lctx.putImageData(L, 0, 0);
   }
   ctx.drawImage(layer, box.x, box.y);
+}
+
+// Suaviza el temblor entre fotogramas: más suavizado si la cara está quieta, menos si se mueve rápido.
+function smoothPts(prev, cur) {
+  if (!prev) return cur;
+  const fw = Math.hypot(cur[454].x - cur[234].x, cur[454].y - cur[234].y) || 1;
+  let m = 0;
+  for (const i of [1, 33, 263, 152]) m += Math.hypot(cur[i].x - prev[i].x, cur[i].y - prev[i].y);
+  m /= 4 * fw;
+  const a = Math.min(0.95, Math.max(0.3, 0.3 + m * 18));
+  return cur.map((p, i) => ({ x: prev[i].x + (p.x - prev[i].x) * a, y: prev[i].y + (p.y - prev[i].y) * a }));
 }
 
 /* ---------- Proceso completo ---------- */
@@ -366,8 +461,13 @@ async function process() {
   running = true; refreshGo();
   els.outStage.style.display = "none"; resultFile = null;
   try {
-    const tracked = faceCands.length ? faceCands.filter((c) => c.selected).map((c) => ({ x: c.cx, y: c.cy })) : null;
-    if (tracked && !tracked.length) throw new Error("Elige al menos una cara del video para cambiar.");
+    const selectMode = faceCands.length > 1;
+    const tracks = [];
+    if (selectMode) {
+      const sel = faceCands.filter((c) => c.selected);
+      if (!sel.length) throw new Error("Elige al menos una cara del video para cambiar.");
+      sel.forEach((c) => tracks.push({ x: c.cx, y: c.cy, pts: null, miss: 0, face: null }));
+    }
     setStatus("Analizando la cara de la foto…");
     await prepareSourceFace(photoFile);
 
@@ -409,24 +509,30 @@ async function process() {
       ctx.drawImage(video, 0, 0, W, H);
       const ts = Math.max(performance.now(), lastTs + 1); lastTs = ts;
       const res = videoLandmarker.detectForVideo(video, ts);
-      const faces = res.faceLandmarks;
-      let targets = faces;
-      if (tracked) {
-        // Sigue cada cara elegida: se empareja con la más cercana a su última posición.
-        targets = [];
-        const used = new Set();
-        for (const t of tracked) {
-          let best = -1, bd = 0.3;
-          faces.forEach((lm, i) => {
-            if (used.has(i)) return;
-            const c = centroid(lm), d = Math.hypot(c.x - t.x, c.y - t.y);
-            if (d < bd) { bd = d; best = i; }
-          });
-          if (best >= 0) { used.add(best); const c = centroid(faces[best]); t.x = c.x; t.y = c.y; targets.push(faces[best]); }
+      const faces = res.faceLandmarks.map((lm) => ({ lm, c: centroid(lm), used: false }));
+      // Empareja cada cara seguida con la detectada más cercana a su última posición.
+      for (const t of tracks) {
+        let best = null, bd = 0.3;
+        for (const f of faces) {
+          if (f.used) continue;
+          const d = Math.hypot(f.c.x - t.x, f.c.y - t.y);
+          if (d < bd) { bd = d; best = f; }
         }
+        t.face = best; if (best) best.used = true; else t.miss++;
       }
-      if (faces.length) for (const lm of targets) swapFace(ctx, toPixels(lm, W, H), W, H);
-      else noFaceFrames++;
+      if (!selectMode) {
+        // Sin selección: toda cara nueva que aparezca se sigue y se cambia.
+        for (const f of faces) if (!f.used) { f.used = true; tracks.push({ x: f.c.x, y: f.c.y, pts: null, miss: 0, face: f }); }
+        for (let i = tracks.length - 1; i >= 0; i--) if (tracks[i].miss > 12) tracks.splice(i, 1);
+      }
+      const likeness = els.like.value / 100;
+      for (const t of tracks) {
+        if (!t.face) { if (t.miss > 3) t.pts = null; continue; }
+        t.miss = 0; t.x = t.face.c.x; t.y = t.face.c.y;
+        t.pts = smoothPts(t.pts, toPixels(t.face.lm, W, H));
+        swapFace(ctx, t.pts, W, H, likeness);
+      }
+      if (!faces.length) noFaceFrames++;
       if (els.mark.checked) {
         ctx.font = `600 ${fontPx}px system-ui, sans-serif`;
         ctx.textAlign = "right"; ctx.textBaseline = "bottom";
